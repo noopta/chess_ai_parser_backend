@@ -31,7 +31,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let response = client.get_chess_games(request).await?;
     
-    println!("RESPONSE={:?}", response);
+    // println!("RESPONSE={:?}", response);
 
     Ok(())
 }

@@ -1,7 +1,13 @@
+use std::io::{BufRead, BufReader, Write};
+use std::process::{Command, Stdio};
+
+
 use tokio::io::split;
 use tonic::{transport::Server, Request, Response, Status};
 use reqwest::header;
 use reqwest::Client;
+use std::sync::Arc;
+use std::sync::Mutex;
 
 // use hello_world::greeter_server::{Greeter, GreeterServer};
 use hello_world::greeter_server::{Greeter};
@@ -9,6 +15,9 @@ use hello_world::{HelloReply, HelloRequest};
 use hello_world::chess_service_server::{ChessService, ChessServiceServer};
 use hello_world::{ProfileRequestData};
 use regex::Regex;
+
+use chess::{Board, ChessMove, Square};
+
 
 fn parse_game_pgn(pgn: &str) -> String {
 
@@ -24,12 +33,33 @@ fn parse_game_pgn(pgn: &str) -> String {
     "abc".to_string()
 }  
 
+fn convert_pgn_moves_to_lan(moves: Vec<String>) -> Vec<String> {
+    let mut board = Board::default();
+    let mut lan_moves = Vec::new();
+
+    for curr_move in moves {
+        if let Ok(chess_move) = ChessMove::from_san(&board, &curr_move) {
+            let origin = chess_move.get_source();
+            let dest = chess_move.get_dest();
+
+            let lan_move = format!("{}{}", origin, dest);
+            lan_moves.push(lan_move);
+
+            board = board.make_move_new(chess_move);
+        } else {
+            println!("Invalid move: {}", curr_move);
+        }
+    }
+
+    lan_moves
+}
+
 fn convert_cp_to_chances(cp: &i32) -> f64{
     let float_cp: f64 = *cp as f64;
 
     let exponent: f64 = -1.0 * (float_cp / 400.0);
 
-    println!("exponent = {}", exponent.to_string());
+    // println!("exponent = {}", exponent.to_string());
 
     let base: f64 = 10.0;
 
@@ -74,10 +104,12 @@ fn convert_to_san(input: &str) -> String {
     // Actually, because the PGN can have an odd number of tokens (some partial moves), we should handle that carefully.
 
     let mut output_moves = Vec::new();
+
     let mut i = 0;
     while i < tokens.len() {
         // White move
         let white_move = tokens[i];
+        // println!("token: {}", tokens[i]);
         i += 1;
 
         // Black move (if exists)
@@ -92,7 +124,8 @@ fn convert_to_san(input: &str) -> String {
     }
 
     // --- 5. Join moves with ", " ---
-    let final_output = output_moves.join(", ");
+    // let final_output = output_moves.join(", ");
+    let final_output = tokens.join(", ");
     final_output
 }
 
@@ -239,6 +272,14 @@ impl ChessService for ChessStruct {
 
                 let chess_san = convert_to_san(&first_game.pgn);
 
+                let split_moves = chess_san
+                    .split(", ")
+                    .map(|s| s.to_string())
+                    .collect();
+
+                let lan_moves: Vec<String> = convert_pgn_moves_to_lan(split_moves);
+                let lan_moves_copy = lan_moves.clone();
+
                 // let's just focus on creating the functions necessary for one game, 
                 // then ideally we should have the approach for all games at scale
 
@@ -247,12 +288,87 @@ impl ChessService for ChessStruct {
                 let split_san = chess_san.split(", ");
                 
                 let mut probabilites: Vec<f64> = Vec::new();
-                
-                for curr_move in split_san {
+
+                let mut child = Command::new("../Stockfish/src/stockfish")
+                // creates a standard input pipe
+                    .stdin(Stdio::piped())
+                    // creates a standard output pipe 
+                    .stdout(Stdio::piped())
+                    .spawn()?; // spawns the child process
+            
+                let mut stdin = child.stdin.take().unwrap();
+                let stdout = child.stdout.take().unwrap();
+                let mut depth_one_cp: f64;
+                let mut probabilities: Arc<Mutex<Vec<f64>>> = Arc::new(Mutex::new(Vec::new()));
+                let probabilities_thread: Arc<Mutex<Vec<f64>>> = Arc::clone(&probabilities);
+            
+                let reader_thread = std::thread::spawn(move || {
+                    let reader = BufReader::new(stdout);
+            
+                    for line in reader.lines() {
+                        if let Ok(line) = line {
+                            if line.starts_with("info depth 1") {
+                                // println!("ENGINE: {}", line);
+                                let split_line: Vec<&str> = line.split(" ").collect();
+
+                                for i in 0..split_line.len() {
+                                    if split_line[i].to_string().starts_with("cp") {
+                                        let parsed_value: i32 = split_line[i + 1].parse().expect("Not a valid integer");
+                                        let mut probs = probabilities_thread.lock().unwrap();
+                                      
+                                        // probabilities_thread.push(convert_cp_to_chances(&parsed_value));
+                                        // (x * 100.0).round() / 100.0
+                                        probs.push((convert_cp_to_chances(&parsed_value) * 100.0).round() / 100.0);
+                                        // probs.push(convert_cp_to_chances(&parsed_value));
+                                        break;
+                                    } 
+                                }
+//                                 player: black || move: a8h1 || prob = 0.02177404821346721
+// player: white || move: h3g4 || prob = 0.9908586214747741
+
+                            } else if line.starts_with("bestmove") {
+                                // println!("ENGINE BEST MOVE: {}", line);
+                            }
+                        }
+                    }
+                });
+
+                let mut current_moves: String = "".to_string();
+                let mut count = 3;
+
+                // writeln!(stdin, "position startpos")?;
+                // writeln!(stdin, "go depth 10")?;
+                writeln!(stdin, "uci")?;
+                writeln!(stdin, "isready")?;
+                for curr_move in &lan_moves {
                     // feed move by move to stockfish and store the result 
                     // in an array
-                    println!("move: {}", curr_move);
+
+                    // add the current move to the current_moves
+                    // then feed the current_moves string to stockfish
+                    // tell stockfish to go a certain depth 
+
+                    // then read the lines back 
+
+                    current_moves.push_str(&curr_move);
+                    println!("current move: {}", current_moves);
+                    current_moves.push_str(" ");
+                    // writeln!(stdin, "position startpos moves {}", current_moves)?;
+     
+                    writeln!(stdin, "position startpos moves {}", current_moves)?;
+                    writeln!(stdin, "go depth 3")?;
+
+                    // println!("move: {}", curr_move);
+                    // count = count - 1;
+
+                    // if count == 0 {
+                    //     break;
+                    // }
+                    
                 }
+
+                writeln!(stdin, "quit")?;
+
 
                 // println!("game in SAN: {}", convert_to_san(&first_game.pgn));
                 let cp: i32 = 100;
@@ -262,6 +378,45 @@ impl ChessService for ChessStruct {
                 println!("result cp: {}", result.to_string());
 
                 let proto_response = chess_response.into_proto();
+                reader_thread.join().expect("Issue closing reader thread");
+                println!("yo");
+                
+                let final_probabilities =  probabilities.lock().unwrap();
+
+                // for curr_prob in final_probabilities.iter() {
+                //     println!("prob = {}", curr_prob);
+                // }
+                let mut player: String = "white".to_string();
+                let mut white_probs: Vec<f64> = Vec::new();
+                let mut black_probs: Vec<f64> = Vec::new();
+
+
+                for i in 0..final_probabilities.len() {
+                    // println!("player: {} || move: {} || prob = {}",player, lan_moves[i], final_probabilities[i]);
+
+                    if player == "white".to_string() {
+                        white_probs.push(final_probabilities[i]);
+                        player = "black".to_string();
+                    } else {
+                        black_probs.push(final_probabilities[i]);
+                        player = "white".to_string();
+                    }
+                }
+
+                for i in 0..white_probs.len() {
+                    println!("white prob at move: {} = {}", i, white_probs[i]);
+                }
+
+                for i in 0..black_probs.len() {
+                    println!("black prob at move: {} = {}", i, black_probs[i]);
+                }
+               
+                // for i in 0..final_probabilities.len() {
+                //     println!("Index: {}, Probability: {}", i, final_probabilities[i]);
+                // }
+
+                println!("LEN FP= {} MOVES LEN = {}", final_probabilities.len(), lan_moves.len());
+
                 Ok(Response::new(proto_response))
             },
             Err(e) => Err(Status::internal(format!("Error fetching games: {}", e))),
