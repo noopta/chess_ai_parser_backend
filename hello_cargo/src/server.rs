@@ -8,6 +8,8 @@ use reqwest::header;
 use reqwest::Client;
 use std::sync::Arc;
 use std::sync::Mutex;
+use std::collections::BinaryHeap;
+use std::cmp::Ordering;
 
 // use hello_world::greeter_server::{Greeter, GreeterServer};
 use hello_world::greeter_server::{Greeter};
@@ -16,7 +18,31 @@ use hello_world::chess_service_server::{ChessService, ChessServiceServer};
 use hello_world::{ProfileRequestData};
 use regex::Regex;
 
-use chess::{Board, ChessMove, Square};
+use chess::{Board, ChessMove, Piece, Square};
+use std::str::FromStr;
+use std::time::Instant;
+
+struct MovesTuple(f64, i32);
+
+impl PartialEq for MovesTuple {
+    fn eq(&self, other: &Self) -> bool {
+        self.0 == other.0
+    }
+}
+
+impl Eq for MovesTuple {}
+
+impl Ord for MovesTuple {
+    fn cmp(&self, other: &Self) -> Ordering {
+        self.0.partial_cmp(&other.0).unwrap_or(Ordering::Equal)
+    }
+}
+
+impl PartialOrd for MovesTuple {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
 
 
 fn parse_game_pgn(pgn: &str) -> String {
@@ -32,6 +58,79 @@ fn parse_game_pgn(pgn: &str) -> String {
 
     "abc".to_string()
 }  
+
+fn convert_lan_to_fen(lan_moves: &str) -> String {
+    let mut board = Board::default(); // Standard initial position
+
+    for lan_move in lan_moves.split_whitespace() {
+        if(lan_move.len() == 0) {
+            continue;
+        }
+
+        // Parse the LAN string (e.g. "e2e4", "e7e8=Q", "e7e8Q", etc.) into a ChessMove
+        let chess_move = parse_lan(lan_move)
+            .unwrap_or_else(|err| panic!("Invalid LAN '{}': {}", lan_move, err));
+        
+        // Optionally, you might want to verify the move is legal in `board`:
+        // if !board.is_legal(chess_move) {
+        //     panic!("Illegal move '{}' in current position.", lan_move);
+        // }
+
+        // Make the move on a new board
+        board = board.make_move_new(chess_move);
+    }
+
+    // Return the FEN of the resulting position
+    board.to_string()
+}
+
+/// Parse a LAN string (like "e2e4", "e7e8=Q", "e7e8Q") into a `ChessMove`.
+fn parse_lan(lan: &str) -> Result<ChessMove, String> {
+    // The first four characters should be from- and to-squares, e.g. "e2e4".
+    if lan.len() < 4 {
+        return Err("LAN move too short".to_string());
+    }
+
+    let from_str = &lan[0..2];
+    let to_str   = &lan[2..4];
+
+    // Convert strings like "e2" into a `Square`
+    let from_square = Square::from_str(from_str)
+        .map_err(|_| format!("Invalid 'from' square: {}", from_str))?;
+    let to_square = Square::from_str(to_str)
+        .map_err(|_| format!("Invalid 'to' square: {}", to_str))?;
+
+    // Check for a promotion piece (Q, R, B, N) with or without '='.
+    // Examples of valid promotions: "e7e8=Q", "e7e8Q".
+    let promotion = match lan.len() {
+        5 => {
+            // e.g. "e7e8Q"
+            let promo_char = lan.chars().nth(4).unwrap();
+            Some(char_to_piece(promo_char)?)
+        }
+        6 if lan.chars().nth(4) == Some('=') => {
+            // e.g. "e7e8=Q"
+            let promo_char = lan.chars().nth(5).unwrap();
+            Some(char_to_piece(promo_char)?)
+        }
+        _ => None, // No promotion
+    };
+
+    // Construct the ChessMove
+    Ok(ChessMove::new(from_square, to_square, promotion))
+}
+
+/// Helper to convert a char ('Q', 'R', 'B', 'N') into the corresponding `Piece`.
+fn char_to_piece(c: char) -> Result<Piece, String> {
+    match c {
+        'Q' => Ok(Piece::Queen),
+        'R' => Ok(Piece::Rook),
+        'B' => Ok(Piece::Bishop),
+        'N' => Ok(Piece::Knight),
+        _ => Err(format!("Invalid promotion piece: '{}'", c)),
+    }
+}
+
 
 fn convert_pgn_moves_to_lan(moves: Vec<String>) -> Vec<String> {
     let mut board = Board::default();
@@ -241,6 +340,7 @@ impl ChessService for ChessStruct {
         &self,
         request: Request<ProfileRequestData>,
     ) -> Result<Response<hello_world::ChessApiGameResponse >, Status> {
+        let start = Instant::now();
         let request_ref = request.get_ref().clone();
         println!("Chess request {:?}", request_ref);
         
@@ -301,6 +401,11 @@ impl ChessService for ChessStruct {
                 let mut depth_one_cp: f64;
                 let mut probabilities: Arc<Mutex<Vec<f64>>> = Arc::new(Mutex::new(Vec::new()));
                 let probabilities_thread: Arc<Mutex<Vec<f64>>> = Arc::clone(&probabilities);
+
+                let mut best_moves: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+                let mut best_moves_thread: Arc<Mutex<Vec<String>>> = Arc::clone(&best_moves);
+
+                let mut fen_values: Vec<String> = Vec::new();
             
                 let reader_thread = std::thread::spawn(move || {
                     let reader = BufReader::new(stdout);
@@ -328,6 +433,9 @@ impl ChessService for ChessStruct {
 
                             } else if line.starts_with("bestmove") {
                                 // println!("ENGINE BEST MOVE: {}", line);
+                                let mut moves = best_moves_thread.lock().unwrap();
+
+                                moves.push(line);
                             }
                         }
                     }
@@ -349,22 +457,17 @@ impl ChessService for ChessStruct {
                     // tell stockfish to go a certain depth 
 
                     // then read the lines back 
-
+                    
                     current_moves.push_str(&curr_move);
-                    println!("current move: {}", current_moves);
+                    
+                    fen_values.push(convert_lan_to_fen(&current_moves));
+                    println!("FEN: {}", convert_lan_to_fen(&current_moves));
+                    println!("current move: {}", curr_move);
                     current_moves.push_str(" ");
                     // writeln!(stdin, "position startpos moves {}", current_moves)?;
      
                     writeln!(stdin, "position startpos moves {}", current_moves)?;
                     writeln!(stdin, "go depth 3")?;
-
-                    // println!("move: {}", curr_move);
-                    // count = count - 1;
-
-                    // if count == 0 {
-                    //     break;
-                    // }
-                    
                 }
 
                 writeln!(stdin, "quit")?;
@@ -375,11 +478,10 @@ impl ChessService for ChessStruct {
 
                 let result = convert_cp_to_chances(&cp);
 
-                println!("result cp: {}", result.to_string());
+                // println!("result cp: {}", result.to_string());
 
                 let proto_response = chess_response.into_proto();
                 reader_thread.join().expect("Issue closing reader thread");
-                println!("yo");
                 
                 let final_probabilities =  probabilities.lock().unwrap();
 
@@ -392,31 +494,56 @@ impl ChessService for ChessStruct {
 
 
                 for i in 0..final_probabilities.len() {
-                    // println!("player: {} || move: {} || prob = {}",player, lan_moves[i], final_probabilities[i]);
-
-                    if player == "white".to_string() {
-                        white_probs.push(final_probabilities[i]);
-                        player = "black".to_string();
-                    } else {
-                        black_probs.push(final_probabilities[i]);
-                        player = "white".to_string();
-                    }
+                    black_probs.push(((1.0 - final_probabilities[i]) * 100.0).round() / 100.0);
                 }
 
-                for i in 0..white_probs.len() {
-                    println!("white prob at move: {} = {}", i, white_probs[i]);
-                }
+                // so this won't work if the other probability + curr > 1 or less than 1
+                // so just pick one
+
+                // each probabilty calculated is white's chance to win
+                let mut flag = false;
 
                 for i in 0..black_probs.len() {
-                    println!("black prob at move: {} = {}", i, black_probs[i]);
+                    if(!flag) {
+                        println!("white = {} black = {} move = {}", final_probabilities[i], black_probs[i], lan_moves[i]);
+                    }
+                    
+                    flag = !flag;
                 }
-               
-                // for i in 0..final_probabilities.len() {
-                //     println!("Index: {}, Probability: {}", i, final_probabilities[i]);
-                // }
 
-                println!("LEN FP= {} MOVES LEN = {}", final_probabilities.len(), lan_moves.len());
+                // given a window of size 2, we want to find the biggest drops 
+                // so an O(n) approach is simply just iterating through and calculating the difference between subsequent elements 
 
+                let mut white_probs_diffs: Vec<f64> = Vec::new();
+                let mut priority_queue = BinaryHeap::new();
+
+                for i in (2..final_probabilities.len()).step_by(2) {
+                    // (((1.0 - final_probabilities[i]) * 100.0).round() / 100.0);
+                    priority_queue.push(MovesTuple(((final_probabilities[i - 2] - final_probabilities[i]) * 100.0).round() / 100.0, i as i32));
+                    // white_probs_diffs[i] = final_probabilities[i] - final_probabilities[i - 2]; 
+                }
+
+                // poll the 3 top elements 
+                // sort by index because that will be what's required for our feedback
+
+                let mut count = 3;
+                let mut biggest_diffs: Vec<(f64, i32)> = Vec::new();
+
+                while count != 0 {
+                    let curr_touple = priority_queue.pop().unwrap();
+                    biggest_diffs.push((curr_touple.0, curr_touple.1));
+                    count = count - 1;
+                }
+
+                let final_best_moves =  best_moves.lock().unwrap();
+                biggest_diffs.sort_by(|a,b| a.1.cmp(&b.1));
+
+                for i in 0..biggest_diffs.len() {
+                    println!("BIGGEST DIFF FOUND = {} AT ROUND = {} BEST MOVE = {}, PLAYED MOVE = {}", biggest_diffs[i].0, biggest_diffs[i].1 + 1, final_best_moves[biggest_diffs[i].1 as usize], lan_moves[biggest_diffs[i].1 as usize]);
+                }
+                let duration = start.elapsed();
+
+                println!("Program time: {}", duration.as_millis());
                 Ok(Response::new(proto_response))
             },
             Err(e) => Err(Status::internal(format!("Error fetching games: {}", e))),
