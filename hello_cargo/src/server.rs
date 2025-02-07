@@ -1,6 +1,5 @@
 use std::process::{Stdio};
 
-
 use tokio::io::split;
 use tokio::io::{AsyncWriteExt, AsyncBufReadExt, BufReader};
 use tonic::{transport::Server, Request, Response, Status};
@@ -11,6 +10,9 @@ use tokio::sync::{Mutex, mpsc::Receiver};
 use std::collections::BinaryHeap;
 use std::cmp::Ordering;
 use anyhow::{Result, Error};
+use tonic_web::GrpcWebLayer;
+use tower_http::cors::{CorsLayer, Any, AllowOrigin};
+use tonic::codegen::http::HeaderValue;
 
 // use hello_world::greeter_server::{Greeter, GreeterServer};
 
@@ -23,6 +25,7 @@ use tokio::{
     process::Command
 };
 use tokio::sync::mpsc::{self, Sender};
+use tower::ServiceBuilder;
 
 pub mod hello_cargo {
     tonic::include_proto!("hello_cargo");
@@ -204,6 +207,8 @@ async fn read_one_move_analysis(
                 best_move = split_line[1].to_string();
             }
             break;
+        } else {
+            println!("engine: {} ", line);
         }
         line.clear();
     }
@@ -346,7 +351,7 @@ fn convert_pgn_moves_to_lan(moves: Vec<String>) -> Vec<String> {
 fn convert_cp_to_chances(cp: &i32) -> f64{
     let float_cp: f64 = *cp as f64;
 
-    let exponent: f64 = -1.0 * (float_cp / 400.0);
+    let exponent: f64 = -1.0 * (float_cp / 700.0);
 
     // println!("exponent = {}", exponent.to_string());
 
@@ -606,6 +611,8 @@ impl hello_cargo::chess_service_server::ChessService for ChessStruct {
                     parsed_game_data.lan_moves = lan_moves;
                     parsed_game_data.probabilities = analysis.probabilities;
                     parsed_game_data.best_moves = analysis.best_moves;
+                    parsed_game_data.username = &username;
+                    
 
                     {
                         let mut guard = game_proto_response.lock().await;
@@ -625,18 +632,17 @@ impl hello_cargo::chess_service_server::ChessService for ChessStruct {
 
                 let guard = game_proto_response.lock().await;
                 println!("games: {}", guard.games.len());
+                
+                let guard_clone = guard.clone();
 
-                for i in 0..guard.games.len() {
-                    let games = guard.games.clone();
+                let first_game = guard_clone.games.get(0).unwrap();
+                
 
-                    for j in 0..games.len() {
-                        for k in 0..games[j].best_moves.len() {
-                            println!("Current move: {} Probability to win: {} Best Move at Depth 6: {} Fen: {}", 
-                        games[j].lan_moves[k], games[j].probabilities[k], games[j].best_moves[k], games[j].fen_values[k]
-                        )
-                        }
-                    }
+                for i in 0..first_game.best_moves.len() {
+                    println!("move: {} best move: {} white's prob curr: {}", first_game.lan_moves[i], first_game.best_moves[i], first_game.probabilities[i]);
                 }
+
+
                 let duration = start.elapsed();
                 println!("Program time: {}", duration.as_millis());
                 Ok(Response::new(guard.clone()))
@@ -849,20 +855,37 @@ impl Greeter for MyGreeter {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let addr = "[::1]:50051".parse()?;
+    // let addr = "[::1]:50051".parse()?;
     // let greeter = MyGreeter::default();
 
-    let chess_service = ChessStruct::new();
+    let origin_strings = vec![
+        "http://localhost:3000",
+        // Add more allowed origins here if needed
+    ];
+    
+    // Convert &str to tonic::codegen::http::HeaderValue
+    let allowed_origins: Vec<HeaderValue> = origin_strings
+        .into_iter()
+        .map(|origin| {
+            HeaderValue::from_str(origin).expect("Invalid origin string")
+        })
+        .collect();
+    
+    // Configure CORS to allow your React app's origin
+    let cors = CorsLayer::new()
+    .allow_origin(Any)
+    .allow_methods(Any)
+    .allow_headers(Any);
 
-    // Server::builder()
-    //     .add_service(GreeterServer::new(greeter))
-    //     .serve(addr)
-    //     .await?;
+    let chess_struct = ChessStruct::new();
 
+    let chess_service = ChessServiceServer::new(chess_struct);
 
-    Server::builder()
-    .add_service(ChessServiceServer::new(chess_service))
-    .serve(addr)
+    let server = Server::builder()
+    .layer(GrpcWebLayer::new())
+    .layer(cors)
+    .add_service(chess_service)
+    .serve(([0,0,0,0], 50051).into())
     .await?;
 
     Ok(())
