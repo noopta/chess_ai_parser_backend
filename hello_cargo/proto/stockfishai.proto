@@ -6,8 +6,23 @@ service Greeter {
 }
 
 service ChessService {
-    rpc GetChessGames (ProfileRequestData) returns (ChessApiGameResponse);
+    rpc GetChessGames (ProfileRequestData) returns (ChessGamesResponse);
 }
+
+message ChessGamesResponse {
+    repeated ParsedChessGameData games = 1;
+}
+
+message ParsedChessGameData {
+    repeated double probabilities = 1;
+    repeated string lan_moves = 2;
+    repeated string san_moves = 3;
+    repeated string fen_values = 4;
+    repeated string best_moves = 5;
+    string username = 6;
+    string opponent = 7;
+}
+
 
 message ProfileRequestData {
     string username = 1;
