@@ -7,7 +7,7 @@ use reqwest::header;
 use reqwest::Client;
 use std::sync::{Arc, PoisonError};
 use tokio::sync::{Mutex, mpsc::Receiver};
-use std::collections::BinaryHeap;
+use std::collections::{BinaryHeap, HashMap};
 use std::cmp::Ordering;
 use anyhow::{Result, Error};
 use tonic_web::GrpcWebLayer;
@@ -26,13 +26,14 @@ use tokio::{
 };
 use tokio::sync::mpsc::{self, Sender};
 use tower::ServiceBuilder;
+use tokio::fs::File;
 
 pub mod hello_cargo {
     tonic::include_proto!("hello_cargo");
 }
 
 use hello_cargo::greeter_server::{Greeter};
-use hello_cargo::{ChessApiGameResponse, ParsedChessGameData, ChessGamesResponse, HelloReply, HelloRequest};
+use hello_cargo::{ChessApiGameResponse, ParsedChessGameData, DiffPair,ChessGamesResponse, HelloReply, HelloRequest, ChessPlayer};
 use hello_cargo::chess_service_server::{ChessService, ChessServiceServer};
 use hello_cargo::{ProfileRequestData};
 
@@ -47,6 +48,7 @@ pub struct AnalysisResult {
     pub probabilities: Vec<f64>,
     pub best_moves: Vec<String>,
     pub fen_values: Vec<String>,
+    pub biggest_diffs: Vec<DiffPair>,
 }
 
 #[derive(Debug)]
@@ -91,7 +93,7 @@ impl StockfishPool {
             .await
             .map_err(|e| anyhow::anyhow!("Worker dropped: {}", e))?;
 
-        println!("result received: {} {} { }", result.best_moves.len(), result.fen_values.len(), result.probabilities.len());
+        // println!("result received: {} {} { }", result.best_moves.len(), result.fen_values.len(), result.probabilities.len());
         Ok(result)
     }
 }
@@ -160,11 +162,47 @@ pub async fn create_stockfish_instance(mut rx: Arc<Mutex<Receiver<AnalysisReques
             best_moves.push(best);
         }
 
+        let mut priority_queue = BinaryHeap::new();
+
+        for i in (2..probabilities.len()).step_by(2) {
+            // (((1.0 - final_probabilities[i]) * 100.0).round() / 100.0);
+            priority_queue.push(MovesTuple(((probabilities[i - 2] - probabilities[i]) * 100.0).round() / 100.0, i as i32));
+            // white_probs_diffs[i] = final_probabilities[i] - final_probabilities[i - 2]; 
+        }
+        // poll the 3 top elements 
+        // sort by index because that will be what's required for our feedback
+
+        let mut count = 3;
+        let mut biggest_diffs: Vec<(f64, i32)> = Vec::new();
+
+        while count != 0 {
+
+            match priority_queue.pop() {
+                Some(curr_touple) => {
+                    biggest_diffs.push((curr_touple.0, curr_touple.1));
+                    count = count - 1;
+                }
+                None => {
+                    println!("None value at pq");
+                    count = count - 1;
+                }
+            }
+        }
+
+        let mut biggest_diffs_proto: Vec<DiffPair> = Vec::new();
+        for diff in biggest_diffs {
+            biggest_diffs_proto.push(DiffPair {
+                probability: diff.0,
+                move_number: diff.1,
+            });
+        }
+
         // We have all data for this game. Construct an AnalysisResult
         let analysis_result = AnalysisResult {
             probabilities,
             best_moves,
             fen_values,
+            biggest_diffs: biggest_diffs_proto,
         };
 
         // Send result back to the caller
@@ -191,6 +229,7 @@ async fn read_one_move_analysis(
     while stdout.read_line(&mut line).await? > 0 {
         // e.g. lines with "info depth 6 cp <val>" 
         if line.starts_with("info depth 6") {
+            // println!("line: {}", line);
             let split_line: Vec<&str> = line.split_whitespace().collect();
             // find "cp" and parse next
             if let Some(cp_idx) = split_line.iter().position(|s| *s == "cp") {
@@ -208,7 +247,7 @@ async fn read_one_move_analysis(
             }
             break;
         } else {
-            println!("engine: {} ", line);
+            // println!("engine: {} ", line);
         }
         line.clear();
     }
@@ -341,23 +380,26 @@ fn convert_pgn_moves_to_lan(moves: Vec<String>) -> Vec<String> {
 
             board = board.make_move_new(chess_move);
         } else {
-            println!("Invalid move: {}", curr_move);
+            // println!("Invalid move: {}", curr_move);
         }
     }
 
     lan_moves
 }
 
-fn convert_cp_to_chances(cp: &i32) -> f64{
-    let float_cp: f64 = *cp as f64;
-
-    let exponent: f64 = -1.0 * (float_cp / 700.0);
-
-    // println!("exponent = {}", exponent.to_string());
-
-    let base: f64 = 10.0;
-
-    return 1.0 / (1.0 + ((base.powf(exponent))));
+fn convert_cp_to_chances(centipawns: &i32) -> f64 {
+    let float_cp: f64 = *centipawns as f64;
+    
+    // k' is a scaling factor, similar to the 0.002 in the logistic function
+    let k: f64 = 0.002;
+    
+    // Calculate tanh(k × cp)
+    let tanh_result = (k * float_cp).tanh();
+    
+    // Shift from [-1, 1] to [0, 1]:
+    // 1. Add 1 to shift to [0, 2]
+    // 2. Divide by 2 to scale to [0, 1]
+    return (tanh_result + 1.0) / 2.0;
 }
 
 fn convert_to_san(input: &str) -> String {
@@ -431,12 +473,12 @@ pub struct ChessStruct{
     pool: StockfishPool,
 }
 
-#[derive(serde::Deserialize, Debug, Clone)]
+#[derive(serde::Deserialize, serde::Serialize, Debug, Clone)]
 struct LocalChessApiGameResponse {
     games: Vec<LocalGame>
 }
 
-#[derive(serde::Deserialize, Debug, Clone)]
+#[derive(serde::Deserialize, serde::Serialize, Debug, Clone)]
 struct LocalGame {
     url: String,
     pgn: String,
@@ -446,7 +488,7 @@ struct LocalGame {
     black: LocalChessPlayer
 }
 
-#[derive(serde::Deserialize, Debug, Clone)]
+#[derive(serde::Deserialize, serde::Serialize, Debug, Clone)]
 struct LocalChessPlayer {
     rating: i32,
     result: String,
@@ -485,13 +527,235 @@ impl LocalChessPlayer {
     }
 }
 
+// next step is determine if they LOST or won with that opening move
+// ok so lets assume for now  we have the openings and their move counts 
+// basically what we need to do is get the data we want 
+// what counts as "good data"?
+// moves that are played like 2 times seem kind of invalid and biased - couldve been luck 
+// and is just simply not enough times proven to win with that move 
 
+
+// now lets solve for the year first, and then worry about the month to month or selected time frame after 
+
+// so want the top 3 openings with highest percetnage based on this criteria 
+// and then the top 3 lowest for the same criteria 
+
+
+
+async fn get_opening_statistics(username: &str, year: &str, month: &str) -> Result<LocalChessApiGameResponse, Box<dyn std::error::Error + Send + Sync>> {
+    let mut final_response = None;
+    let mut opening_move_counts: HashMap<String, i32> = HashMap::new();
+    let mut opening_move_wins: HashMap<String, i32> = HashMap::new();
+
+    for month in 1..13 {
+        let month_str = format!("{:02}", month);
+        let _endpoint_url: String = format!(
+            "https://api.chess.com/pub/player/noopdogg07/games/{}/{}",
+            year, month_str
+        );
+
+        // Build a client so we can add headers
+        let client = Client::new();
+        let response = client
+            .get(&_endpoint_url)
+            .header(header::USER_AGENT, "wallace.dev@proton.me")
+            .send()
+            .await?;
+
+        // we need to get the percentage of wins with each opening move 
+        // now what is the number of wins relateive to? is it divided by the number of times the move is played?
+        // or is it divided by the total number of games played?
+
+        // do it by the number of times the move is played
+
+
+
+        if response.status().is_success() {
+            let json_response: LocalChessApiGameResponse = response.json().await?;
+            let mut file = File::create("opening_statistics.json").await?;
+            file.write_all(serde_json::to_string(&json_response)?.as_bytes()).await?;
+
+            // Clone games before first use
+            let games_copy = json_response.games.clone();
+            
+            // so if black wins it'd be 0-1
+            // if white wins it'd be 1-0
+            // First loop using games_copy
+
+            // so the question I have is 
+            let mut isWhite = false;
+            let mut user_won = false;
+
+            for game in games_copy {
+                let split_pgn: Vec<&str> = game.pgn.split("\n").collect();
+                
+                for line in split_pgn {
+                    // println!("line: {}", line);
+                    // println!("username: {}", username);
+
+                    // output looks like this line: [White "jatinsainia7"]
+                    // so we need to parse out the username
+                    let split_line: Vec<&str> = line.split(" ").collect();
+
+                    // if the line contains "White"
+                    if line.contains("White") {
+                        let currname = split_line[1].trim();
+                        // "Mancungs99"] is what the output looks like, we need to parse out the username
+                        let split_currname: Vec<&str> = currname.split("]").collect();
+                        let currname = split_currname[0].trim();
+
+                        // currently it looks like "noopdogg07" we want to take away the quotations 
+                        let currname = currname.replace("\"", "");
+                        // println!("currName: {}", currname); 
+
+                        if currname == username {
+                            // println!("match found");
+                            isWhite = true;
+                        }
+                    }
+
+                    // if the line contains "Black"
+                    if line.contains("Black") {
+                        let currname = split_line[1].trim();
+                        // "Mancungs99"] is what the output looks like, we need to parse out the username
+                        let split_currname: Vec<&str> = currname.split("]").collect();
+                        let currname = split_currname[0].trim();
+                        // println!("currName: {}", currname);
+
+                        // currently it looks like "noopdogg07" we want to take away the quotations 
+                        let currname = currname.replace("\"", "");
+                        // println!("currName: {}", currname);
+
+                        if currname == username {
+                            isWhite = false;
+                        }
+                    }
+
+                    // the line will look like this: [Result "1-0"]
+                    // so we need to parse out the 1-0
+                    if line.contains("Result") {
+                        let split_line: Vec<&str> = line.split(" ").collect();
+                        let result = split_line[1].trim();
+                        // println!("result: {}", result);
+
+                        if result.contains("1-0") && isWhite {
+                            user_won = true;
+                        }
+
+                        if result.contains("0-1") && !isWhite {
+                            user_won = false;
+                        }
+                    }
+
+                    
+                    if line.contains("ECOUrl") {
+                        let split_line: Vec<&str> = line.split(":").collect();
+                        let eco_url = split_line[1].trim();
+
+                        // from eco__url parse out the string starting after openings e.g. ECOUrl "https://www.chess.com/openings/Queens-Pawn-Opening-Horwitz-Defense-2.c4"
+                        let split_eco_url: Vec<&str> = eco_url.split("openings/").collect();
+            
+                        let opening_move = split_eco_url[1].trim();
+
+                        // remove any quotation marks, and any brackets like ] or [
+                        let opening_move = opening_move.replace("\"", "").replace("[", "").replace("]", "");
+                        // println!("Opening move: {}", opening_move);
+
+                        // if the opening_move is not Undefined, then increment the count for the opening move
+                        if opening_move != "Undefined" {
+                            if user_won {
+                                *opening_move_wins.entry(opening_move.to_string()).or_insert(0) += 1;
+                            }
+
+                            *opening_move_counts.entry(opening_move.to_string()).or_insert(0) += 1;
+                        }
+                    }
+                }
+            // print the opening move counts
+            // for (opening_move, count) in &opening_move_counts {
+            //     println!("Opening move: {} count: {}", opening_move, count);
+            // }
+
+        
+            // which data structure to use?
+            // we can use hashmap but that doesn't keep track of the order 
+            // we can use a vector of tuples sorted by win percentage 
+            // for simplicity sake, we can use a hashmap 
+
+
+            // for (opening_move, count) in &sorted_opening_move_counts {
+            //     let win_percentage = opening_move_wins.get(*opening_move).unwrap_or(&0).to_owned() as f64 / **count as f64 * 100.0;
+            //     println!("Opening move: {} count: {} win percentage: {}", 
+            //         opening_move, 
+            //         count, 
+            //         win_percentage
+            //     );
+            // }
+
+
+
+            }
+            final_response = Some(json_response.clone());
+        }
+    }
+
+    // sort the opening move counts by count in descending order
+    let mut sorted_opening_move_counts = opening_move_counts.iter().collect::<Vec<_>>();
+    sorted_opening_move_counts.sort_by(|a, b| b.1.cmp(&a.1));
+    // now we need to know which openings have a count greater than 3
+    let mut openings_with_count_greater_than_three: Vec<String> = Vec::new();
+    for (opening_move, count) in &sorted_opening_move_counts {
+        if **count > 3 {
+            openings_with_count_greater_than_three.push(opening_move.to_string());
+        }
+    }
+
+    let mut top_three_openings_map: HashMap<String, f64> = HashMap::new();
+    let mut bottom_three_openings_map: HashMap<String, f64> = HashMap::new();
+    // we need to know which openings have a count greater than 3
+    // create a seperate vector with tuples of [opening_move, win_percentage]
+    let mut openings_with_count_greater_than_three_tuples: Vec<(String, f64)> = Vec::new();
+
+    for opening_move in openings_with_count_greater_than_three {
+        let win_percentage = opening_move_wins.get(&opening_move).unwrap_or(&0).to_owned() as f64 / opening_move_counts.get(&opening_move).unwrap_or(&0).to_owned() as f64 * 100.0;
+        openings_with_count_greater_than_three_tuples.push((opening_move, win_percentage));
+    }
+
+    // sort the vector by win percentage in descending order
+    openings_with_count_greater_than_three_tuples.sort_by(|a, b| {
+        b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal)
+    });
+
+    // now we need to populate the top and bottom three openings maps
+    for i in 0..3 {
+        top_three_openings_map.insert(openings_with_count_greater_than_three_tuples[i].0.clone(), openings_with_count_greater_than_three_tuples[i].1);
+
+        // bottom should get from the last 3 elements
+        bottom_three_openings_map.insert(openings_with_count_greater_than_three_tuples[openings_with_count_greater_than_three_tuples.len() - i - 1].0.clone(), openings_with_count_greater_than_three_tuples[openings_with_count_greater_than_three_tuples.len() - i - 1].1);
+    }
+    
+    println!("Top three openings: {:?}", top_three_openings_map);
+    println!("Bottom three openings: {:?}", bottom_three_openings_map);
+    
+    // Return the final response or an error
+    match final_response {
+        Some(response) => Ok(response),
+        None => Err(Box::new(std::io::Error::new(
+            std::io::ErrorKind::Other,
+            "No successful response found",
+        )))
+    }
+}
 
 async fn fetch_games(username: &str, month: &str, year: &str) -> Result<LocalChessApiGameResponse, Box<dyn std::error::Error + Send + Sync>> {
     let _endpoint_url: String = format!(
         "https://api.chess.com/pub/player/{}/games/{}/{}",
         username, year, month
     );
+
+    println!("here");
+
+    let opening_statistics = get_opening_statistics("noopdogg07", "2024", "10").await?;  
 
    // Build a client so we can add headers
    let client = Client::new();
@@ -548,7 +812,7 @@ impl hello_cargo::chess_service_server::ChessService for ChessStruct {
     ) -> Result<Response<hello_cargo::ChessGamesResponse >, Status> {
         let start = Instant::now();
         let request_ref = request.get_ref().clone();
-        println!("Chess request {:?}", request_ref);
+        // println!("Chess request {:?}", request_ref);
         
         // int rating = 1;
         // string result = 2;
@@ -611,8 +875,21 @@ impl hello_cargo::chess_service_server::ChessService for ChessStruct {
                     parsed_game_data.lan_moves = lan_moves;
                     parsed_game_data.probabilities = analysis.probabilities;
                     parsed_game_data.best_moves = analysis.best_moves;
-                    parsed_game_data.username = &username;
-                    
+                    parsed_game_data.biggest_diffs = analysis.biggest_diffs;
+
+                    let mut white_player = ChessPlayer::default();
+                    let mut black_player = ChessPlayer::default();
+
+                    white_player.rating = first_game.white.rating;
+                    white_player.result = first_game.white.result;
+                    white_player.username = first_game.white.username;
+
+                    black_player.rating = first_game.black.rating;
+                    black_player.result = first_game.black.result;
+                    black_player.username = first_game.black.username;
+
+                    parsed_game_data.white = Some(white_player);
+                    parsed_game_data.black = Some(black_player);                    
 
                     {
                         let mut guard = game_proto_response.lock().await;
@@ -631,19 +908,24 @@ impl hello_cargo::chess_service_server::ChessService for ChessStruct {
                 // println!("len of chess games: {}", chess_proto_response.lock().unwrap().games.len());
 
                 let guard = game_proto_response.lock().await;
-                println!("games: {}", guard.games.len());
+                // println!("games: {}", guard.games.len());
                 
                 let guard_clone = guard.clone();
 
-                let first_game = guard_clone.games.get(0).unwrap();
+                let guard_len = guard_clone.games.len();
+
+                let first_game = guard_clone.games.get(guard_len - 1).unwrap();
                 
 
-                for i in 0..first_game.best_moves.len() {
-                    println!("move: {} best move: {} white's prob curr: {}", first_game.lan_moves[i], first_game.best_moves[i], first_game.probabilities[i]);
-                }
+                // for i in 0..first_game.best_moves.len() {
+                //     println!("move: {} best move: {} white's prob curr: {}", first_game.lan_moves[i], first_game.best_moves[i], first_game.probabilities[i]);
+                // }
 
 
                 let duration = start.elapsed();
+                // write the response to a text file
+                // print the first game 
+                // println!("first game: {:?}", first_game);
                 println!("Program time: {}", duration.as_millis());
                 Ok(Response::new(guard.clone()))
             },
